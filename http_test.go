@@ -27,6 +27,115 @@ func Test_NewClient(t *testing.T) {
 	}
 }
 
+func Test_NewClientWithLoadBalancer(t *testing.T) {
+	if _, err := NewClientWithLoadBalancer(nil, nil); err == nil {
+		t.Fatalf("expected error for nil load balancer")
+	}
+}
+
+func Test_NewRoundRobinClient_ExecuteAndQuery(t *testing.T) {
+	var executeCalls int
+	var queryCalls int
+
+	mkServer := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/db/execute":
+				executeCalls++
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(`{"results": [{"last_insert_id": 1, "rows_affected": 1}]}`))
+			case "/db/query":
+				queryCalls++
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(`{"results": [{"columns": ["n"], "types": ["integer"], "values": [[1]]}]}`))
+			default:
+				t.Fatalf("unexpected path: %s", r.URL.Path)
+			}
+		}))
+	}
+
+	ts1 := mkServer()
+	defer ts1.Close()
+	ts2 := mkServer()
+	defer ts2.Close()
+
+	client, err := NewRoundRobinClient([]string{ts1.URL, ts2.URL}, nil)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	defer client.Close()
+
+	if _, err := client.ExecuteSingle(context.Background(), "CREATE TABLE foo (id INTEGER)"); err != nil {
+		t.Fatalf("unexpected execute error: %v", err)
+	}
+	if _, err := client.QuerySingle(context.Background(), "SELECT 1"); err != nil {
+		t.Fatalf("unexpected query error: %v", err)
+	}
+
+	if executeCalls != 1 {
+		t.Fatalf("expected 1 execute call, got %d", executeCalls)
+	}
+	if queryCalls != 1 {
+		t.Fatalf("expected 1 query call, got %d", queryCalls)
+	}
+}
+
+func Test_NewRoundRobinClientWithHealth(t *testing.T) {
+	cl, err := NewRoundRobinClientWithHealth(
+		[]string{"http://localhost:4001", "http://localhost:4002"},
+		func(*url.URL) bool { return true },
+		time.Second,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	defer cl.Close()
+}
+
+func Test_ClientMarksBadHostOnTransportError(t *testing.T) {
+	tsBad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	badURL := tsBad.URL
+	tsBad.Close()
+
+	tsGood := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/status" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{}`))
+	}))
+	defer tsGood.Close()
+
+	rrb, err := NewRoundRobinBalancerWithHealth(
+		[]string{badURL, tsGood.URL},
+		func(u *url.URL) bool { return u.String() == tsGood.URL },
+		10*time.Millisecond,
+	)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	defer rrb.Close()
+
+	cl, err := NewClientWithLoadBalancer(rrb, nil)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	defer cl.Close()
+
+	if _, err := cl.Status(context.Background()); err == nil {
+		t.Fatalf("expected transport error from bad host")
+	}
+
+	if got := len(rrb.Bad()); got != 1 {
+		t.Fatalf("expected 1 bad host, got %d", got)
+	}
+
+	if _, err := cl.Status(context.Background()); err != nil {
+		t.Fatalf("expected good host success, got %v", err)
+	}
+}
+
 func Test_BasicAuth(t *testing.T) {
 	username := "user"
 	password := "pass"

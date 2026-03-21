@@ -14,6 +14,7 @@ This library offers support for:
 - Booting a rqlite node from a SQLite database file
 - Checking node status, diagnostic info, cluster membership, and readiness
 - Ability to customize HTTP communications for control over TLS, mutual TLS, timeouts, etc.
+- Optional round-robin load-balancing across multiple rqlite nodes
 
 Check out the [documentation](https://pkg.go.dev/github.com/rqlite/rqlite-go-http) for more details.
 
@@ -77,6 +78,37 @@ func main() {
 	fmt.Printf("QueryResponse: %+v\n", qResp)
 }
 ```
+
+## Round-robin load-balanced execute/query client
+
+When you want client-side node selection for SQL execution and querying, create a
+round-robin client and keep calls focused on `Execute*` / `Query*` methods.
+
+```go
+client, err := rqlitehttp.NewRoundRobinClient([]string{
+    "http://node1:4001",
+    "http://node2:4001",
+    "http://node3:4001",
+}, nil)
+if err != nil {
+    panic(err)
+}
+defer client.Close()
+
+_, err = client.ExecuteSingle(context.Background(), "CREATE TABLE foo (id INTEGER PRIMARY KEY, name TEXT)")
+if err != nil {
+    panic(err)
+}
+
+_, err = client.QuerySingle(context.Background(), "SELECT COUNT(*) FROM foo")
+if err != nil {
+    panic(err)
+}
+```
+
+To enable health checking, use `NewRoundRobinClientWithHealth(...)` and pass a
+checker function plus check interval. Hosts that fail a transport request are
+marked bad and periodically rechecked before being returned to rotation.
 
 ## Handling numbers
 When handling a JSON response from rqlite which a number, this library stores it as a [`json.Number`](https://pkg.go.dev/encoding/json#Number). This avoids precision loss. You can then convert it to the type your schema expects. For example, if you expect an `int64`:

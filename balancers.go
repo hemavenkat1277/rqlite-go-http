@@ -5,6 +5,7 @@ import (
 	"math/rand/v2"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,6 +24,24 @@ type LoopbackBalancer struct {
 	u *url.URL
 }
 
+// RoundRobinBalancer takes a list of addresses and returns them one-by-one in
+// round-robin order when Next() is called.
+type RoundRobinBalancer struct {
+	mu      sync.RWMutex
+	hosts   map[string]*Host
+	ordered []string
+	next    atomic.Uint64
+
+	chkInterval time.Duration
+	chckFn      HostChecker
+	ch          chan *url.URL
+
+	wg   sync.WaitGroup
+	done chan struct{}
+
+	closeOnce sync.Once
+}
+
 // NewLoopbackBalancer returns a new LoopbackBalancer.
 func NewLoopbackBalancer(address string) (*LoopbackBalancer, error) {
 	u, err := url.Parse(address)
@@ -38,6 +57,167 @@ func NewLoopbackBalancer(address string) (*LoopbackBalancer, error) {
 // Next returns the next address in the list of addresses.
 func (lb *LoopbackBalancer) Next() (*url.URL, error) {
 	return lb.u, nil
+}
+
+// NewRoundRobinBalancer returns a new RoundRobinBalancer.
+func NewRoundRobinBalancer(addresses []string) (*RoundRobinBalancer, error) {
+	return newRoundRobinBalancer(addresses, nil, 0)
+}
+
+// NewRoundRobinBalancerWithHealth returns a round-robin balancer with health
+// checking support. Hosts marked bad via MarkBad() are periodically rechecked
+// and moved back into rotation once healthy.
+func NewRoundRobinBalancerWithHealth(addresses []string, chckFn HostChecker, d time.Duration) (*RoundRobinBalancer, error) {
+	return newRoundRobinBalancer(addresses, chckFn, d)
+}
+
+func newRoundRobinBalancer(addresses []string, chckFn HostChecker, d time.Duration) (*RoundRobinBalancer, error) {
+	seen := make(map[string]struct{}, len(addresses))
+	hosts := make(map[string]*Host, len(addresses))
+	ordered := make([]string, 0, len(addresses))
+
+	for _, s := range addresses {
+		u, err := url.Parse(s)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[u.String()]; ok {
+			return nil, ErrDuplicateAddresses
+		}
+		seen[u.String()] = struct{}{}
+		hosts[u.String()] = &Host{URL: u, Healthy: true}
+		ordered = append(ordered, u.String())
+	}
+
+	if len(ordered) == 0 {
+		return nil, ErrNoHostsAvailable
+	}
+
+	rrb := &RoundRobinBalancer{
+		hosts:       hosts,
+		ordered:     ordered,
+		chkInterval: d,
+		chckFn:      chckFn,
+		done:        make(chan struct{}),
+	}
+
+	if chckFn != nil && d > 0 {
+		rrb.ch = make(chan *url.URL, len(ordered))
+		rrb.wg.Add(2)
+		go rrb.checkBadHosts()
+		go rrb.markGoodHosts()
+	}
+
+	return rrb, nil
+}
+
+// Next returns the next address in round-robin order.
+func (rrb *RoundRobinBalancer) Next() (*url.URL, error) {
+	rrb.mu.RLock()
+	defer rrb.mu.RUnlock()
+
+	if len(rrb.ordered) == 0 {
+		return nil, ErrNoHostsAvailable
+	}
+
+	start := rrb.next.Add(1) - 1
+	for i := 0; i < len(rrb.ordered); i++ {
+		idx := (int(start) + i) % len(rrb.ordered)
+		h := rrb.hosts[rrb.ordered[idx]]
+		if h.Healthy {
+			return h.URL, nil
+		}
+	}
+
+	return nil, ErrNoHostsAvailable
+}
+
+// MarkBad marks an address returned by Next() as bad. The balancer will skip
+// it until it is considered healthy again.
+func (rrb *RoundRobinBalancer) MarkBad(u *url.URL) {
+	rrb.mu.Lock()
+	defer rrb.mu.Unlock()
+	h, ok := rrb.hosts[u.String()]
+	if !ok {
+		return
+	}
+	h.Healthy = false
+}
+
+// Healthy returns the slice of currently healthy hosts.
+func (rrb *RoundRobinBalancer) Healthy() []*url.URL {
+	rrb.mu.RLock()
+	defer rrb.mu.RUnlock()
+	var healthy []*url.URL
+	for _, k := range rrb.ordered {
+		if rrb.hosts[k].Healthy {
+			healthy = append(healthy, rrb.hosts[k].URL)
+		}
+	}
+	return healthy
+}
+
+// Bad returns the slice of currently bad hosts.
+func (rrb *RoundRobinBalancer) Bad() []*url.URL {
+	rrb.mu.RLock()
+	defer rrb.mu.RUnlock()
+	var bad []*url.URL
+	for _, k := range rrb.ordered {
+		if !rrb.hosts[k].Healthy {
+			bad = append(bad, rrb.hosts[k].URL)
+		}
+	}
+	return bad
+}
+
+// Close closes the RoundRobinBalancer. A closed balancer should not be reused.
+func (rrb *RoundRobinBalancer) Close() {
+	if rrb.chckFn == nil || rrb.chkInterval <= 0 {
+		return
+	}
+	rrb.closeOnce.Do(func() {
+		close(rrb.done)
+		rrb.wg.Wait()
+	})
+}
+
+func (rrb *RoundRobinBalancer) checkBadHosts() {
+	defer rrb.wg.Done()
+	ticker := time.NewTicker(rrb.chkInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			rrb.mu.RLock()
+			for _, k := range rrb.ordered {
+				host := rrb.hosts[k]
+				if !host.Healthy {
+					if ok := rrb.chckFn(host.URL); ok {
+						rrb.ch <- host.URL
+					}
+				}
+			}
+			rrb.mu.RUnlock()
+		case <-rrb.done:
+			return
+		}
+	}
+}
+
+func (rrb *RoundRobinBalancer) markGoodHosts() {
+	defer rrb.wg.Done()
+	for {
+		select {
+		case u := <-rrb.ch:
+			rrb.mu.Lock()
+			if h, ok := rrb.hosts[u.String()]; ok {
+				h.Healthy = true
+			}
+			rrb.mu.Unlock()
+		case <-rrb.done:
+			return
+		}
+	}
 }
 
 // Host represents a URL and its health status.

@@ -360,6 +360,14 @@ type LoadBalancer interface {
 	Next() (*url.URL, error)
 }
 
+type badHostMarker interface {
+	MarkBad(*url.URL)
+}
+
+type loadBalancerCloser interface {
+	Close()
+}
+
 // Client is the main type through which rqlite is accessed.
 type Client struct {
 	lb         LoadBalancer
@@ -372,12 +380,11 @@ type Client struct {
 	basicAuthPass string
 }
 
-// NewClient creates a new Client with default settings. If httpClient is nil,
-// the the default client is used.
-func NewClient(baseURL string, httpClient *http.Client) (*Client, error) {
-	lb, err := NewLoopbackBalancer(baseURL)
-	if err != nil {
-		return nil, err
+// NewClientWithLoadBalancer creates a new Client that uses the given load balancer.
+// If httpClient is nil, the default HTTP client is used.
+func NewClientWithLoadBalancer(lb LoadBalancer, httpClient *http.Client) (*Client, error) {
+	if lb == nil {
+		return nil, fmt.Errorf("load balancer cannot be nil")
 	}
 
 	cl := &Client{
@@ -388,6 +395,36 @@ func NewClient(baseURL string, httpClient *http.Client) (*Client, error) {
 		cl.httpClient = DefaultHTTPClient()
 	}
 	return cl, nil
+}
+
+// NewClient creates a new Client with default settings. If httpClient is nil,
+// the the default client is used.
+func NewClient(baseURL string, httpClient *http.Client) (*Client, error) {
+	lb, err := NewLoopbackBalancer(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	return NewClientWithLoadBalancer(lb, httpClient)
+}
+
+// NewRoundRobinClient creates a new client that automatically selects nodes in
+// round-robin order for each request.
+func NewRoundRobinClient(baseURLs []string, httpClient *http.Client) (*Client, error) {
+	lb, err := NewRoundRobinBalancer(baseURLs)
+	if err != nil {
+		return nil, err
+	}
+	return NewClientWithLoadBalancer(lb, httpClient)
+}
+
+// NewRoundRobinClientWithHealth creates a new client that automatically selects
+// nodes in round-robin order and supports health checking for hosts marked bad.
+func NewRoundRobinClientWithHealth(baseURLs []string, chckFn HostChecker, d time.Duration, httpClient *http.Client) (*Client, error) {
+	lb, err := NewRoundRobinBalancerWithHealth(baseURLs, chckFn, d)
+	if err != nil {
+		return nil, err
+	}
+	return NewClientWithLoadBalancer(lb, httpClient)
 }
 
 // SetBasicAuth configures the client to use Basic Auth for all subsequent requests.
@@ -733,6 +770,9 @@ func (c *Client) Version(ctx context.Context) (string, error) {
 
 // Close closes the client and should be called when the client is no longer needed.
 func (c *Client) Close() error {
+	if closer, ok := c.lb.(loadBalancerCloser); ok {
+		closer.Close()
+	}
 	return nil
 }
 
@@ -774,6 +814,9 @@ func (c *Client) doRequest(ctx context.Context, method, path string, contentType
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		if marker, ok := c.lb.(badHostMarker); ok {
+			marker.MarkBad(baseURL)
+		}
 		return nil, err
 	}
 	return resp, nil
